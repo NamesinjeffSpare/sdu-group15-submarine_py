@@ -1,3 +1,6 @@
+# Neo6mGPS.py
+# Clean NEO-6M GPS reader using serial + pynmea2
+
 import serial
 import pynmea2
 
