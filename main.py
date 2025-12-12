@@ -4,6 +4,8 @@ import os
 import subprocess
 import requests
 import math
+import shutil
+
 from Neo6mGPS import open_gps, get_gps_fix
 
 INFO_URL = "https://emils-pp.onrender.com/info"
@@ -13,7 +15,10 @@ OLD_URL = "https://emils-pp.onrender.com/old/"
 
 BACKEND_REFRESH = 5      # seconds – how often we poll /info
 GPS_INTERVAL = 1.0       # seconds – how often we try to send GPS updates
-PHOTO_DIR = PHOTO_DIR = os.path.expanduser("~/photos")  # folder on SD card for photos
+
+# Store photos in the current user's home directory (works for emil/pi/systemd)
+PHOTO_DIR = os.path.join(os.path.expanduser("~"), "photos")
+
 CAMERA_AREA_M2 = 1.0
 
 os.makedirs(PHOTO_DIR, exist_ok=True)
@@ -103,6 +108,7 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
             t = i / n
             waypoints.append((x1 + t * dx, y1 + t * dy))
         return waypoints
+
     xs = [p[0] for p in polygon]
     ys = [p[1] for p in polygon]
     min_x = min(xs)
@@ -111,6 +117,7 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
     max_y = max(ys)
     if step <= 0:
         step = max(max_x - min_x, max_y - min_y)
+
     waypoints = []
     y = min_y
     direction = 1
@@ -119,6 +126,7 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
             x_start, x_end = min_x, max_x
         else:
             x_start, x_end = max_x, min_x
+
         length = abs(x_end - x_start)
         segments = max(1, int(math.ceil(length / step)))
         for i in range(segments + 1):
@@ -126,14 +134,19 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
             x = x_start + t * (x_end - x_start)
             if point_in_polygon(x, y, polygon):
                 waypoints.append((x, y))
+
         direction *= -1
         y += step
+
     if not waypoints:
         cx = sum(xs) / len(xs)
         cy = sum(ys) / len(ys)
         waypoints.append((cx, cy))
+
     return waypoints
 
+
+# ----- SEEEDUINO STUBS -----
 
 def read_seeeduino_status():
     return None
@@ -167,22 +180,29 @@ def navigation_step(status, backend, traverse_speed, coverage_waypoints, coverag
     return coverage_index, command_in_flight, failed_waypoints
 
 
-# --------------- FLASHLIGHT STUBS -----------------
+# ----- FLASHLIGHT STUBS -----
 
 def flashlight_on():
-    # TODO: implement GPIO or whatever you use for the light
     print("[FLASHLIGHT] ON")
 
 
 def flashlight_off():
-    # TODO: implement GPIO off logic
     print("[FLASHLIGHT] OFF")
 
 
-# --------------- CAMERA & STORAGE -----------------
+# ----- CAMERA & STORAGE -----
 
 def take_photo_to_file(filepath):
-    cmd = ["libcamera-still", "-n", "-o", filepath]
+    """
+    Use rpicam-still (new Raspberry Pi OS) or libcamera-still (older OS).
+    """
+    cam = shutil.which("rpicam-still") or shutil.which("libcamera-still")
+    if not cam:
+        raise FileNotFoundError(
+            "No camera command found. Install rpicam-apps or libcamera-apps."
+        )
+
+    cmd = [cam, "-n", "-o", filepath]
     print("[CAMERA] Running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
     print("[CAMERA] Saved:", filepath)
@@ -196,6 +216,9 @@ def capture_and_store_photo():
     flashlight_on()
     try:
         take_photo_to_file(filepath)
+    except FileNotFoundError as e:
+        print("[CAMERA] Camera tool missing:", e)
+        filepath = None
     except subprocess.CalledProcessError as e:
         print("[CAMERA] Error taking photo:", e)
         filepath = None
@@ -239,7 +262,7 @@ def upload_all_images():
                 print("[UPLOAD] Failed to delete", filepath, ":", e)
 
 
-# --------------- MAIN LOOP -----------------
+# ----- MAIN LOOP -----
 
 def main():
     # GPS init wrapped in try/except so failure doesn't kill program
@@ -263,7 +286,7 @@ def main():
     if "polygon" not in backend or backend["polygon"] is None:
         backend["polygon"] = []
 
-    photo_interval = get_time_seconds(backend["time"])
+    photo_interval = get_time_seconds(backend.get("time", "0:05"))
     traverse_speed = recommended_speed(CAMERA_AREA_M2, photo_interval)
     photos_needed = compute_photos_needed(backend["polygon"], CAMERA_AREA_M2)
     coverage_waypoints = generate_coverage_waypoints(
@@ -278,11 +301,12 @@ def main():
     last_backend = 0.0
     last_photo_time = 0.0
 
-    prev_explore = backend["explore"]
+    prev_explore = backend.get("explore", False)
 
     print("Running main loop...")
     print("  GPS interval     =", GPS_INTERVAL, "seconds (constant)")
     print("  Photo interval   =", photo_interval, "seconds (from backend)")
+    print("  Photo dir        =", PHOTO_DIR)
     print("  Camera area m^2  =", CAMERA_AREA_M2)
     print("  Polygon points   =", len(backend["polygon"]))
     print("  Photos needed    =", photos_needed)
@@ -332,7 +356,8 @@ def main():
                 backend = new_state
                 if "polygon" not in backend or backend["polygon"] is None:
                     backend["polygon"] = []
-                photo_interval = get_time_seconds(backend["time"])
+
+                photo_interval = get_time_seconds(backend.get("time", "0:05"))
                 traverse_speed = recommended_speed(CAMERA_AREA_M2, photo_interval)
                 photos_needed = compute_photos_needed(backend["polygon"], CAMERA_AREA_M2)
                 coverage_waypoints = generate_coverage_waypoints(
@@ -348,15 +373,15 @@ def main():
                 print("[COVERAGE] waypoints:", len(coverage_waypoints))
 
                 # Example trigger: explore True -> False
-                if prev_explore and not backend["explore"]:
+                if prev_explore and not backend.get("explore", False):
                     print("[TRIGGER] Explore disabled -> uploading all images")
                     upload_all_images()
 
-                prev_explore = backend["explore"]
+                prev_explore = backend.get("explore", False)
 
             last_backend = now
 
-        # --- 2) GPS updates (safe even if GPS is dead or submerged) ---
+        # --- 2) GPS updates ---
         if now - last_gps_send >= GPS_INTERVAL:
             fix = None
             if gps is not None:
@@ -370,17 +395,17 @@ def main():
                 print("[GPS]", fix)
 
                 payload = {
-                    "explore": backend["explore"],
-                    "autonomous": backend["autonomous"],
-                    "meters": backend["meters"],
-                    "sMemory": backend["sMemory"],
-                    "sVoltage": backend["sVoltage"],
-                    "sDry": backend["sDry"],
-                    "time": backend["time"],
+                    "explore": backend.get("explore", False),
+                    "autonomous": backend.get("autonomous", True),
+                    "meters": backend.get("meters", 0),
+                    "sMemory": backend.get("sMemory", 0),
+                    "sVoltage": backend.get("sVoltage", 0),
+                    "sDry": backend.get("sDry", 0),
+                    "time": backend.get("time", "0:05"),
                     "lat": fix["lat"],
                     "lon": fix["lon"],
                     "alt": fix["alt"],
-                    "polygon": backend["polygon"],
+                    "polygon": backend.get("polygon", []),
                 }
 
                 try:
