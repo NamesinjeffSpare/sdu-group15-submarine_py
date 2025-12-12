@@ -13,7 +13,7 @@ OLD_URL = "https://emils-pp.onrender.com/old/"
 
 BACKEND_REFRESH = 5      # seconds – how often we poll /info
 GPS_INTERVAL = 1.0       # seconds – how often we try to send GPS updates
-PHOTO_DIR = "/home/pi/photos"  # folder on SD card for photos
+PHOTO_DIR = PHOTO_DIR = os.path.expanduser("~/photos")  # folder on SD card for photos
 CAMERA_AREA_M2 = 1.0
 
 os.makedirs(PHOTO_DIR, exist_ok=True)
