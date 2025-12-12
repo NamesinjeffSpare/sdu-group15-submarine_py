@@ -40,6 +40,31 @@ def get_backend_state():
         return None
 
 
+def get_free_sd_mb(path=PHOTO_DIR):
+    """
+    Free space (MB) on the filesystem that stores PHOTO_DIR.
+    This reports real SD card free space to backend.
+    """
+    try:
+        st = os.statvfs(path)
+        free_bytes = st.f_bavail * st.f_frsize
+        return int(free_bytes / (1024 * 1024))
+    except Exception as e:
+        print("[SD] Error reading free space:", e)
+        return 0
+
+
+def internet_available():
+    """
+    Fast connectivity check to your backend.
+    """
+    try:
+        requests.get(INFO_URL, timeout=3)
+        return True
+    except Exception:
+        return False
+
+
 def polygon_area_m2(polygon):
     if not polygon or len(polygon) < 3:
         return 0.0
@@ -228,7 +253,7 @@ def upload_image(filepath):
     try:
         with open(filepath, "rb") as f:
             files = {"file": (os.path.basename(filepath), f, "image/jpeg")}
-            r = requests.post(UPLOAD_IMAGE_URL, files=files, timeout=20)
+            r = requests.post(UPLOAD_IMAGE_URL, files=files, timeout=30)
         print("[UPLOAD] Status:", r.status_code, r.text)
         return 200 <= r.status_code < 300
     except Exception as e:
@@ -237,18 +262,32 @@ def upload_image(filepath):
 
 
 def upload_all_images():
-    print("[UPLOAD] Uploading all images from", PHOTO_DIR)
+    # Only attempt if online
+    if not internet_available():
+        print("[UPLOAD] No internet – queued images kept on SD")
+        return
 
-    for name in sorted(os.listdir(PHOTO_DIR)):
+    print("[UPLOAD] Internet detected – uploading queued images from", PHOTO_DIR)
+
+    files = sorted(os.listdir(PHOTO_DIR))
+    for name in files:
         if not name.lower().endswith((".jpg", ".jpeg", ".png")):
             continue
+
         filepath = os.path.join(PHOTO_DIR, name)
-        if upload_image(filepath):
+        print("[UPLOAD] Trying:", filepath)
+
+        success = upload_image(filepath)
+        if success:
             try:
                 os.remove(filepath)
-                print("[UPLOAD] Deleted local file:", filepath)
+                print("[UPLOAD] Uploaded + deleted:", filepath)
             except OSError as e:
                 print("[UPLOAD] Failed to delete", filepath, ":", e)
+        else:
+            print("[UPLOAD] Failed – will retry later:", filepath)
+            # stop on first failure (likely connection dropped)
+            break
 
 
 # --------------- MAIN LOOP -----------------
@@ -297,6 +336,7 @@ def main():
     last_send = 0.0
     last_backend = 0.0
     last_photo_time = 0.0
+    last_upload_attempt = 0.0
     prev_explore = backend.get("explore", False)
 
     print("Running main loop...")
@@ -355,6 +395,7 @@ def main():
                 print("[COVERAGE] traverse_speed:", traverse_speed)
                 print("[COVERAGE] waypoints:", len(coverage_waypoints))
 
+                # Existing trigger kept
                 if prev_explore and not backend.get("explore", False):
                     print("[TRIGGER] Explore disabled -> uploading all images")
                     upload_all_images()
@@ -382,7 +423,10 @@ def main():
                 "explore": backend.get("explore", False),
                 "autonomous": backend.get("autonomous", True),
                 "meters": backend.get("meters", 0),
-                "sMemory": backend.get("sMemory", 0),
+
+                # REAL free SD space (MB)
+                "sMemory": get_free_sd_mb(),
+
                 "sVoltage": backend.get("sVoltage", 0),
                 "sDry": backend.get("sDry", 0),
                 "time": backend.get("time", "0:05"),
@@ -407,6 +451,12 @@ def main():
             if filepath:
                 print("[CAMERA] Stored photo at:", filepath)
             last_photo_time = now
+
+        # --- attempt upload periodically when internet is available ---
+        # (does nothing underwater, uploads everything when back online)
+        if now - last_upload_attempt >= 10.0:
+            upload_all_images()
+            last_upload_attempt = now
 
         time.sleep(0.1)
 
