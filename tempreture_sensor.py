@@ -1,39 +1,27 @@
+
 import time
-
-import adafruit_dht
 import board
+import adafruit_dht # to read from the DHT sensor
 
-PIN = board.D4  # GPIO4
+# sensor data pin to gpio4
 
-print("[DHT] Starting DHT11 on GPIO4 (board.D4)...")
-
-sensor = adafruit_dht.DHT11(PIN)
+sensor = adafruit_dht.DHT11(board.D4)
 
 while True:
     try:
+        # print the values to serial port
         temperature_c = sensor.temperature
+        temperature_f = temperature_c * (9 / 5) + 32
         humidity = sensor.humidity
+        print("Temp={0:0.1f}ºC, Temp={1:0.1f}ºF, Humidity={2:0.1f}%".format(temperature_c, temperature_f, humidity))
 
-        if temperature_c is None or humidity is None:
-            print("[DHT] Read returned None (retrying...)")
-        else:
-            temperature_f = temperature_c * 9.0 / 5.0 + 32.0
-            print(
-                "Temp={0:0.1f}°C Temp={1:0.1f}°F Humidity={2:0.1f}%".format(
-                    temperature_c, temperature_f, humidity
-                )
-            )
-
-    except RuntimeError as e:
-        # Expected sometimes for DHT sensors
-        print("[DHT] RuntimeError:", e)
-
-    except Exception as e:
-        print("[DHT] Fatal error:", e)
-        try:
-            sensor.exit()
-        except Exception:
-            pass
-        raise
+    except RuntimeError as error:
+        # errors are often; DHTs are hard to read, just keep going
+        print(error.args[0])
+        time.sleep(2.0)
+        continue
+    except Exception as error:
+        sensor.exit()
+        raise error
 
     time.sleep(3.0)
