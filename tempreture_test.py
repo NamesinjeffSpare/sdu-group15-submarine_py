@@ -1,6 +1,6 @@
 import time
 import board
-from temperature_sensor import TemperatureSensor
+from tempreture_sensor import TemperatureSensor
 
 ts = TemperatureSensor(pin=board.D4, sensor_type="DHT11", interval_s=3.0)
 
