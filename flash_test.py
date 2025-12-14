@@ -17,6 +17,9 @@ try:
         print(f"Blink {i+1}: ON")
         time.sleep(ON_TIME)
 
+        GPIO.output(FLASHLIGHT_PIN, GPIO.LOW)   # flashlight OFF
+        print(f"Blink {i+1}: OFF")
+        time.sleep(OFF_TIME)
 
 finally:
     GPIO.output(FLASHLIGHT_PIN, GPIO.LOW)
