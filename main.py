@@ -11,6 +11,7 @@ from leakage_sensor import LeakageConfig, LeakageSensor
 from RGB import RGB
 from tempreture_sensor import TemperatureSensor
 from Neo6mGPS import open_gps, get_gps_fix
+from serial_link import NanoLink, SerialLinkConfig
 
 INFO_URL = "https://emils-pp.onrender.com/info/"
 UPDATE_URL = "https://emils-pp.onrender.com/update/"
@@ -177,12 +178,16 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
 
 # --------------- SEEEDUINO STUBS -----------------
 
-def read_seeeduino_status():
-    return None
+# --- Serial link (Arduino Nano / Seeeduino) ---
+_link = NanoLink(SerialLinkConfig(port="/dev/ttyUSB0", baud=115200))
 
+def read_seeeduino_status():
+    # returns dict or None
+    return _link.read_status()
 
 def send_goto_to_seeeduino(x, y, speed):
-    print("[SEND GOTO]", x, y, speed)
+    # include GPS context if you want (optional)
+    return _link.send_goto(x, y, speed)
 
 
 def navigation_step(status, backend, traverse_speed, coverage_waypoints, coverage_index, command_in_flight, failed_waypoints):
@@ -462,7 +467,6 @@ def main():
             upload_all_images()
             last_upload_attempt = now
 
-        time.sleep(0.1)
 
 
 if __name__ == "__main__":
