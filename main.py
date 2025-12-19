@@ -175,12 +175,6 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
 
     return waypoints
 
-
-# --------------- SEEEDUINO STUBS -----------------
-
-# --- Serial link (Arduino Nano / Seeeduino) ---
-_link = NanoLink(SerialLinkConfig(port="/dev/ttyUSB0", baud=115200))
-
 def read_seeeduino_status():
     # returns dict or None
     return _link.read_status()
@@ -466,7 +460,6 @@ def main():
         if now - last_upload_attempt >= 10.0:
             upload_all_images()
             last_upload_attempt = now
-
 
 
 if __name__ == "__main__":
