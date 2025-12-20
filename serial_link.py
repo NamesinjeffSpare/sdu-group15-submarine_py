@@ -25,7 +25,7 @@ def init_serial():
 
     # Use pigpio serial read callback for RX
     def _rx_callback(gpio, level, tick):
-        nonlocal _rx_buffer, _last_rx_time
+        global _rx_buffer, _last_rx_time
         if level != pigpio.FALLING_EDGE:
             return
         try:
