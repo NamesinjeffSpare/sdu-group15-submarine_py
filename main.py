@@ -25,6 +25,19 @@ CAMERA_AREA_M2 = 1.0
 
 os.makedirs(PHOTO_DIR, exist_ok=True)
 
+# ---------------- SERIAL LINK CONFIG ----------------
+
+# Pi GPIO 21 (TX) -> Nano RX (D6)
+# Pi GPIO 20 (RX) <- Nano TX (D7)
+_SERIAL_CONFIG = SerialLinkConfig(
+    port="/dev/serial0",
+    baud=9600,
+    rx_gpio=21,   # Pi TX
+    tx_gpio=20,   # Pi RX
+)
+
+_link = NanoLink(_SERIAL_CONFIG)
+
 
 def get_time_seconds(timer_str):
     """Convert MM:SS -> seconds."""
@@ -175,13 +188,46 @@ def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
 
     return waypoints
 
+
+# --------------- SERIAL / SEEEDUINO WRAPPERS -----------------
+
 def read_seeeduino_status():
     # returns dict or None
     return _link.read_status()
 
+
 def send_goto_to_seeeduino(x, y, speed):
-    # include GPS context if you want (optional)
+    """
+    Send next goto waypoint to Seeeduino: x, y in meters, speed in m/s.
+    This keeps the original contract that other coders expect.
+    """
     return _link.send_goto(x, y, speed)
+
+
+def send_state_to_seeeduino(
+    above_seabed_m,
+    autonomous,
+    lat,
+    lon,
+    alt,
+    temp_c,
+    hum_pct,
+    leakage,
+):
+    """
+    Send state packet to Seeeduino. serial_link.NanoLink is expected to
+    turn this into the 'PI,...' line for the microcontroller.
+    """
+    return _link.send_state(
+        above_seabed_m=above_seabed_m,
+        autonomous=autonomous,
+        lat=lat,
+        lon=lon,
+        alt=alt,
+        temp_c=temp_c,
+        hum_pct=hum_pct,
+        leakage=leakage,
+    )
 
 
 def navigation_step(status, backend, traverse_speed, coverage_waypoints, coverage_index, command_in_flight, failed_waypoints):
@@ -407,7 +453,7 @@ def main():
 
             last_backend = now
 
-        # --- ALWAYS send update to backend ---
+        # --- ALWAYS send update to backend + state to Seeeduino ---
         if now - last_send >= GPS_INTERVAL:
             fix = None
             if gps is not None:
@@ -422,6 +468,7 @@ def main():
             else:
                 print("[GPS] No fix – sending last known position")
 
+            # Send state to backend
             payload = {
                 "explore": backend.get("explore", False),
                 "autonomous": backend.get("autonomous", True),
@@ -444,6 +491,30 @@ def main():
                 print("[UPDATE] Status:", r.status_code)
             except Exception as e:
                 print("[UPDATE] POST error:", e)
+
+            # --- ALSO send state to Seeeduino over serial ---
+
+            above_seabed_m = backend.get("meters", 0)
+            autonomous = backend.get("autonomous", True)
+
+            # TODO: hook real sensor readings here instead of 0.0/False:
+            temp_c = 0.0
+            hum_pct = 0.0
+            leakage = False
+
+            try:
+                send_state_to_seeeduino(
+                    above_seabed_m=above_seabed_m,
+                    autonomous=autonomous,
+                    lat=last_lat,
+                    lon=last_lon,
+                    alt=last_alt,
+                    temp_c=temp_c,
+                    hum_pct=hum_pct,
+                    leakage=leakage,
+                )
+            except Exception as e:
+                print("[SERIAL] Error sending state to Seeeduino:", e)
 
             last_send = now
 
