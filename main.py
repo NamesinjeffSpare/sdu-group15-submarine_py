@@ -18,69 +18,86 @@ UPDATE_URL = "https://emils-pp.onrender.com/update/"
 UPLOAD_IMAGE_URL = "https://emils-pp.onrender.com/upload_image/"
 OLD_URL = "https://emils-pp.onrender.com/old/"
 
-BACKEND_REFRESH = 5      # seconds – how often we poll /info
-GPS_INTERVAL = 1.0       # seconds – how often we try to send updates
-PHOTO_DIR = os.path.join(os.path.expanduser("~"), "photos")
-CAMERA_AREA_M2 = 1.0
+BACKEND_REFRESH = 5      # seconds – how often we poll the backend
+GPS_INTERVAL = 5         # seconds – how often we send GPS + state
+PHOTO_DIR = "/home/pi/photos"
+CAMERA_AREA_M2 = 4.0     # footprint area in m^2 for each photo (example)
 
-os.makedirs(PHOTO_DIR, exist_ok=True)
-
-# ---------------- SERIAL LINK CONFIG ----------------
-
-# Pi GPIO 21 (TX) -> Nano RX (D6)
-# Pi GPIO 20 (RX) <- Nano TX (D7)
 _SERIAL_CONFIG = SerialLinkConfig(
     port="/dev/serial0",
     baud=9600,
-    rx_gpio=21,   # Pi TX
-    tx_gpio=20,   # Pi RX
+    rx_gpio=20,
+    tx_gpio=21,
 )
-
 _link = NanoLink(_SERIAL_CONFIG)
 
 
-def get_time_seconds(timer_str):
-    """Convert MM:SS -> seconds."""
-    try:
-        m, s = timer_str.split(":")
-        return int(m) * 60 + int(s)
-    except Exception:
-        print("Invalid time format:", timer_str)
-        return 0
+def read_seeeduino_status():
+    return _link.read_status()
+
+
+def send_goto_to_seeeduino(x_m, y_m, speed_ms):
+    return _link.send_goto(x_m, y_m, speed_ms)
+
+
+def send_state_to_seeeduino(
+    above_seabed_m,
+    autonomous,
+    lat,
+    lon,
+    alt,
+    temp_c,
+    hum_pct,
+    leakage,
+    heading_deg=None,
+):
+    """
+    Send state packet to Seeeduino. serial_link.NanoLink is expected to
+    turn this into the 'PI,...' line for the microcontroller.
+
+    heading_deg allows the Raspberry Pi to calibrate the submarine's
+    forward direction using GPS and pass that on to the microcontroller.
+    If heading_deg is None the field is omitted.
+    """
+    return _link.send_state(
+        above_seabed_m=above_seabed_m,
+        autonomous=autonomous,
+        lat=lat,
+        lon=lon,
+        alt=alt,
+        temp_c=temp_c,
+        hum_pct=hum_pct,
+        leakage=leakage,
+        heading_deg=heading_deg,
+    )
 
 
 def get_backend_state():
     try:
         r = requests.get(INFO_URL, timeout=6)
-        return r.json()
+        if r.status_code == 200:
+            return r.json()
+        else:
+            print("[BACKEND] /info/ status", r.status_code)
     except Exception as e:
-        print("Error fetching backend state:", e)
-        return None
+        print("[BACKEND] /info/ error:", e)
+    return None
 
 
-def get_free_sd_mb(path=PHOTO_DIR):
-    """
-    Free space (MB) on the filesystem that stores PHOTO_DIR.
-    This reports real SD card free space to backend.
-    """
-    try:
-        st = os.statvfs(path)
-        free_bytes = st.f_bavail * st.f_frsize
-        return int(free_bytes / (1024 * 1024))
-    except Exception as e:
-        print("[SD] Error reading free space:", e)
-        return 0
+def get_free_sd_mb(path="/"):
+    total, used, free = shutil.disk_usage(path)
+    return free // (1024 * 1024)
 
 
-def internet_available():
-    """
-    Fast connectivity check to your backend.
-    """
-    try:
-        requests.get(INFO_URL, timeout=3)
-        return True
-    except Exception:
-        return False
+def get_time_seconds(t_str):
+    parts = t_str.split(":")
+    if len(parts) == 1:
+        return int(parts[0])
+    if len(parts) == 2:
+        minutes = int(parts[0])
+        seconds = int(parts[1])
+        return minutes * 60 + seconds
+    return 0
 
 
 def polygon_area_m2(polygon):
@@ -111,17 +128,40 @@ def recommended_speed(camera_area_m2, photo_interval_s):
     return footprint_length / photo_interval_s
 
 
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Compute bearing in degrees from (lat1, lon1) to (lat2, lon2).
+
+    Returns a value in [0, 360) or None if the movement is too small.
+    """
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return None
+
+    # Rough check to avoid division by zero / noise
+    if abs(lat2 - lat1) < 1e-6 and abs(lon2 - lon1) < 1e-6:
+        return None
+
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+
+    bearing = math.degrees(math.atan2(y, x))
+    bearing = (bearing + 360.0) % 360.0
+    return bearing
+
+
 def point_in_polygon(x, y, polygon):
-    n = len(polygon)
     inside = False
+    n = len(polygon)
     j = n - 1
     for i in range(n):
         xi, yi = polygon[i]
         xj, yj = polygon[j]
-        intersect = ((yi > y) != (yj > y)) and (
+        if ((yi > y) != (yj > y)) and (
             x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi
-        )
-        if intersect:
+        ):
             inside = not inside
         j = i
     return inside
@@ -130,196 +170,89 @@ def point_in_polygon(x, y, polygon):
 def generate_coverage_waypoints(polygon, camera_area_m2, photo_interval_s):
     if not polygon:
         return []
-    if len(polygon) == 1:
-        return [tuple(polygon[0])]
-
-    step = math.sqrt(camera_area_m2) if camera_area_m2 > 0 else 0.0
-
-    if len(polygon) == 2 or step <= 0:
-        x1, y1 = polygon[0]
-        x2, y2 = polygon[1]
-        dx = x2 - x1
-        dy = y2 - y1
-        dist = math.hypot(dx, dy)
-        if dist == 0:
-            return [tuple(polygon[0])]
-        along = step if step > 0 else dist
-        n = max(1, int(math.ceil(dist / along)))
-        waypoints = []
-        for i in range(n + 1):
-            t = i / n
-            waypoints.append((x1 + t * dx, y1 + t * dy))
-        return waypoints
 
     xs = [p[0] for p in polygon]
     ys = [p[1] for p in polygon]
-    min_x = min(xs)
-    max_x = max(xs)
-    min_y = min(ys)
-    max_y = max(ys)
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
 
-    if step <= 0:
-        step = max(max_x - min_x, max_y - min_y)
-
+    lane_spacing = math.sqrt(camera_area_m2) * 0.8
     waypoints = []
+
     y = min_y
     direction = 1
-    while y <= max_y + 1e-9:
+    while y <= max_y:
         if direction > 0:
-            x_start, x_end = min_x, max_x
+            x_range = (min_x, max_x)
         else:
-            x_start, x_end = max_x, min_x
+            x_range = (max_x, min_x)
 
-        length = abs(x_end - x_start)
-        segments = max(1, int(math.ceil(length / step)))
-        for i in range(segments + 1):
-            t = i / segments
-            x = x_start + t * (x_end - x_start)
+        steps = int(abs(x_range[1] - x_range[0]) / lane_spacing) + 1
+        for i in range(steps + 1):
+            x = x_range[0] + (x_range[1] - x_range[0]) * (i / max(1, steps))
             if point_in_polygon(x, y, polygon):
                 waypoints.append((x, y))
 
         direction *= -1
-        y += step
-
-    if not waypoints:
-        cx = sum(xs) / len(xs)
-        cy = sum(ys) / len(ys)
-        waypoints.append((cx, cy))
+        y += lane_spacing
 
     return waypoints
 
 
-# --------------- SERIAL / SEEEDUINO WRAPPERS -----------------
-
-def read_seeeduino_status():
-    # returns dict or None
-    return _link.read_status()
-
-
-def send_goto_to_seeeduino(x, y, speed):
-    """
-    Send next goto waypoint to Seeeduino: x, y in meters, speed in m/s.
-    This keeps the original contract that other coders expect.
-    """
-    return _link.send_goto(x, y, speed)
-
-
-def send_state_to_seeeduino(
-    above_seabed_m,
-    autonomous,
-    lat,
-    lon,
-    alt,
-    temp_c,
-    hum_pct,
-    leakage,
-):
-    """
-    Send state packet to Seeeduino. serial_link.NanoLink is expected to
-    turn this into the 'PI,...' line for the microcontroller.
-    """
-    return _link.send_state(
-        above_seabed_m=above_seabed_m,
-        autonomous=autonomous,
-        lat=lat,
-        lon=lon,
-        alt=alt,
-        temp_c=temp_c,
-        hum_pct=hum_pct,
-        leakage=leakage,
-    )
-
-
-def navigation_step(status, backend, traverse_speed, coverage_waypoints, coverage_index, command_in_flight, failed_waypoints):
-    nav_state = None
-    if status is not None and isinstance(status, dict):
-        nav_state = status.get("nav_state")
-
-    if command_in_flight:
-        if nav_state == "busy":
-            return coverage_index, command_in_flight, failed_waypoints
-        if nav_state == "failed":
-            failed_waypoints += 1
-            command_in_flight = False
-        elif nav_state == "arrived":
-            command_in_flight = False
-
-    if (not command_in_flight) and backend.get("explore") and traverse_speed is not None:
-        if coverage_index < len(coverage_waypoints):
-            x, y = coverage_waypoints[coverage_index]
-            send_goto_to_seeeduino(x, y, traverse_speed)
-            command_in_flight = True
-            coverage_index += 1
-
-    return coverage_index, command_in_flight, failed_waypoints
-
-
-# --------------- FLASHLIGHT STUBS -----------------
-
-def flashlight_on():
-    print("[FLASHLIGHT] ON")
-
-
-def flashlight_off():
-    print("[FLASHLIGHT] OFF")
-
-
-# --------------- CAMERA & STORAGE -----------------
-
-def take_photo_to_file(filepath):
-    cam = shutil.which("rpicam-still") or shutil.which("libcamera-still")
-    if not cam:
-        raise FileNotFoundError("No camera tool found: rpicam-still/libcamera-still")
-
-    cmd = [cam, "-n", "-o", filepath]
-    print("[CAMERA] Running:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
-    print("[CAMERA] Saved:", filepath)
+def internet_available():
+    try:
+        requests.get("https://www.google.com", timeout=3)
+        return True
+    except Exception:
+        return False
 
 
 def capture_and_store_photo():
+    os.makedirs(PHOTO_DIR, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"img_{timestamp}.jpg"
-    filepath = os.path.join(PHOTO_DIR, filename)
+    filepath = os.path.join(PHOTO_DIR, f"photo_{timestamp}.jpg")
 
-    flashlight_on()
     try:
-        take_photo_to_file(filepath)
+        cmd = [
+            "libcamera-still",
+            "-o",
+            filepath,
+            "--width",
+            "1920",
+            "--height",
+            "1080",
+            "--autofocus-on-capture",
+        ]
+        subprocess.run(cmd, check=True)
+        return filepath
     except Exception as e:
-        print("[CAMERA] Error taking photo:", e)
-        filepath = None
-    finally:
-        flashlight_off()
-
-    return filepath
+        print("[CAMERA] Capture error:", e)
+        return None
 
 
 def upload_image(filepath):
-    if not os.path.exists(filepath):
-        print("[UPLOAD] File does not exist:", filepath)
+    if not internet_available():
+        print("[UPLOAD] No internet, skipping upload for now")
         return False
 
     try:
         with open(filepath, "rb") as f:
-            files = {"file": (os.path.basename(filepath), f, "image/jpeg")}
-            r = requests.post(UPLOAD_IMAGE_URL, files=files, timeout=30)
-        print("[UPLOAD] Status:", r.status_code, r.text)
-        return 200 <= r.status_code < 300
+            files = {"file": f}
+            r = requests.post(UPLOAD_IMAGE_URL, files=files, timeout=10)
+        if r.status_code == 200:
+            print("[UPLOAD] Success:", filepath)
+            return True
+        print("[UPLOAD] Failed with status:", r.status_code)
     except Exception as e:
-        print("[UPLOAD] Error uploading", filepath, ":", e)
-        return False
+        print("[UPLOAD] Error:", e)
+    return False
 
 
 def upload_all_images():
-    # Only attempt if online
-    if not internet_available():
-        print("[UPLOAD] No internet – queued images kept on SD")
+    if not os.path.isdir(PHOTO_DIR):
         return
 
-    print("[UPLOAD] Internet detected – uploading queued images from", PHOTO_DIR)
-
-    files = sorted(os.listdir(PHOTO_DIR))
-    for name in files:
+    for name in sorted(os.listdir(PHOTO_DIR)):
         if not name.lower().endswith((".jpg", ".jpeg", ".png")):
             continue
 
@@ -337,6 +270,53 @@ def upload_all_images():
             print("[UPLOAD] Failed – will retry later:", filepath)
             # stop on first failure (likely connection dropped)
             break
+
+
+def navigation_step(
+    status,
+    backend_state,
+    traverse_speed,
+    coverage_waypoints,
+    coverage_index,
+    command_in_flight,
+    failed_waypoints,
+):
+    nav_state = None
+    if status is not None and isinstance(status, dict):
+        nav_state = status.get("nav_state")
+
+    if command_in_flight:
+        if nav_state == "busy":
+            return coverage_index, command_in_flight, failed_waypoints
+        if nav_state == "failed":
+            failed_waypoints += 1
+            command_in_flight = False
+        elif nav_state == "arrived":
+            command_in_flight = False
+
+    if (
+        not command_in_flight
+        and backend_state.get("explore", False)
+        and traverse_speed is not None
+    ):
+        if coverage_index < len(coverage_waypoints):
+            x, y = coverage_waypoints[coverage_index]
+            print(
+                "[COVERAGE] Sending waypoint",
+                coverage_index,
+                "->",
+                (x, y),
+                "speed",
+                traverse_speed,
+            )
+            send_goto_to_seeeduino(x, y, traverse_speed)
+            command_in_flight = True
+            coverage_index += 1
+        else:
+            print("[COVERAGE] All waypoints visited; stopping exploration.")
+            backend_state["explore"] = False
+
+    return coverage_index, command_in_flight, failed_waypoints
 
 
 # --------------- MAIN LOOP -----------------
@@ -369,6 +349,14 @@ def main():
     last_lat = backend.get("lat", 54.9130)
     last_lon = backend.get("lon", 9.7785)
     last_alt = backend.get("alt", 0.0)
+    # Previous GPS fix used to compute heading
+    prev_lat = None
+    prev_lon = None
+    gps_heading_deg = None
+
+    # Status LED on the Raspberry Pi
+    rgb = RGB()
+    led_state = None
 
     photo_interval = get_time_seconds(backend.get("time", "0:05"))
     traverse_speed = recommended_speed(CAMERA_AREA_M2, photo_interval)
@@ -397,10 +385,13 @@ def main():
 
     while True:
         now = time.time()
+        has_warning = False
 
         status = read_seeeduino_status()
         if status is not None:
-            warning0 = int(round((failed_waypoints / total_waypoints_planned) * 100)) if total_waypoints_planned > 0 else 0
+            warning0 = int(
+                round((failed_waypoints / total_waypoints_planned) * 100)
+            ) if total_waypoints_planned > 0 else 0
             if not isinstance(status, dict):
                 status = {}
             status.setdefault("warning_types", [])
@@ -409,6 +400,13 @@ def main():
             else:
                 status["warning_types"][0] = warning0
 
+            # Derive a simple warning flag for the RGB LED
+            if bool(status.get("emergency_active")) or status.get("emergency_reason_mask", 0):
+                has_warning = True
+            ultra_err = status.get("ultrasonic_error_latched")
+            if isinstance(ultra_err, (list, tuple)) and any(ultra_err):
+                has_warning = True
+
             try:
                 r_old = requests.post(OLD_URL, json=status, timeout=6)
                 print("[OLD] Status:", r_old.status_code)
@@ -416,12 +414,16 @@ def main():
                 print("[OLD] POST error:", e)
 
         coverage_index, command_in_flight, failed_waypoints = navigation_step(
-            status, backend, traverse_speed,
-            coverage_waypoints, coverage_index,
-            command_in_flight, failed_waypoints
+            status,
+            backend,
+            traverse_speed,
+            coverage_waypoints,
+            coverage_index,
+            command_in_flight,
+            failed_waypoints,
         )
 
-        # --- poll backend state ---
+        # --- poll backend state ------------------------------------------------
         if now - last_backend >= BACKEND_REFRESH:
             new_state = get_backend_state()
             if new_state:
@@ -430,7 +432,9 @@ def main():
 
                 photo_interval = get_time_seconds(backend.get("time", "0:05"))
                 traverse_speed = recommended_speed(CAMERA_AREA_M2, photo_interval)
-                photos_needed = compute_photos_needed(backend["polygon"], CAMERA_AREA_M2)
+                photos_needed = compute_photos_needed(
+                    backend["polygon"], CAMERA_AREA_M2
+                )
                 coverage_waypoints = generate_coverage_waypoints(
                     backend["polygon"], CAMERA_AREA_M2, photo_interval
                 )
@@ -463,8 +467,15 @@ def main():
                     print("[GPS] Error getting fix:", e)
 
             if fix:
+                # Use consecutive fixes to estimate heading for calibration.
+                prev_lat, prev_lon = last_lat, last_lon
                 last_lat, last_lon, last_alt = fix["lat"], fix["lon"], fix["alt"]
-                print("[GPS] Fix:", fix)
+                gps_h = bearing_deg(prev_lat, prev_lon, last_lat, last_lon)
+                if gps_h is not None:
+                    gps_heading_deg = gps_h
+                    print("[GPS] Fix:", fix, "heading_deg=", gps_heading_deg)
+                else:
+                    print("[GPS] Fix:", fix)
             else:
                 print("[GPS] No fix – sending last known position")
 
@@ -473,10 +484,8 @@ def main():
                 "explore": backend.get("explore", False),
                 "autonomous": backend.get("autonomous", True),
                 "meters": backend.get("meters", 0),
-
                 # REAL free SD space (MB)
-                "sMemory": get_free_sd_mb(),
-
+                "sMemory": get_free_sd_mb(PHOTO_DIR),
                 "sVoltage": backend.get("sVoltage", 0),
                 "sDry": backend.get("sDry", 0),
                 "time": backend.get("time", "0:05"),
@@ -497,7 +506,7 @@ def main():
             above_seabed_m = backend.get("meters", 0)
             autonomous = backend.get("autonomous", True)
 
-            # TODO: hook real sensor readings here instead of 0.0/False:
+            # TODO: hook real sensor readings here instead of 0/False:
             temp_c = 0.0
             hum_pct = 0.0
             leakage = False
@@ -512,11 +521,30 @@ def main():
                     temp_c=temp_c,
                     hum_pct=hum_pct,
                     leakage=leakage,
+                    heading_deg=gps_heading_deg,
                 )
             except Exception as e:
                 print("[SERIAL] Error sending state to Seeeduino:", e)
 
             last_send = now
+
+        # --- LED status (Pi RGB) ---
+        try:
+            if gps is not None and gps_heading_deg is None:
+                desired_led = "calibrating"
+            elif has_warning:
+                desired_led = "warning"
+            elif backend.get("explore", False):
+                # Sub is deployed / running mission
+                desired_led = "deployed"
+            else:
+                desired_led = "awaiting"
+
+            if desired_led != led_state:
+                rgb.set_state(desired_led)
+                led_state = desired_led
+        except Exception as e:
+            print("[LED] Error updating RGB LED:", e)
 
         # --- photo capture ---
         if photo_interval > 0 and (now - last_photo_time) >= photo_interval:

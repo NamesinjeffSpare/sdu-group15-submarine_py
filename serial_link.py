@@ -1,160 +1,234 @@
-# serial_link.py
-#
-# Bit-banged serial link between Raspberry Pi and Arduino/Seeeduino.
-# RX only is enough for now; TX is optional.
-
-import time
 import pigpio
+import time
 
-# ─────────────────────────────────────────────
-# CHANGE THESE IF YOUR WIRING / BAUD IS DIFFERENT
-# ─────────────────────────────────────────────
-RX_GPIO = 20   # Pi pin connected to Arduino TX (D7)
-TX_GPIO = 21   # Pi pin connected to Arduino RX (D6) - only used if you want to send
-BAUD    = 9600 # Must match SoftwareSerial baud on Arduino
-# ─────────────────────────────────────────────
+RX_GPIO = 20  # GPIO pin for RX (from Seeeduino TX)
+TX_GPIO = 21  # GPIO pin for TX (to Seeeduino RX)
+BAUD = 9600
 
 _pi = None
-_rx_buffer = ""
-_tx_ready = False
+_rx_buffer = bytearray()
+_last_rx_time = 0.0
 
 
 def init_serial():
-    """Call once at startup (or lazily)."""
-    global _pi, _tx_ready
-
+    global _pi, _rx_buffer, _last_rx_time
     if _pi is not None:
         return
 
     _pi = pigpio.pi()
     if not _pi.connected:
-        raise RuntimeError("pigpiod not running. Run: sudo systemctl start pigpiod")
+        raise RuntimeError("pigpio daemon not running / not connected")
 
-    # RX: bit-banged serial receive
-    _pi.bb_serial_read_open(RX_GPIO, BAUD, 8)
-
-    # TX: normal output pin (we will use wave_add_serial)
+    # Set up TX as output, RX as input
     _pi.set_mode(TX_GPIO, pigpio.OUTPUT)
-    _tx_ready = True
+    _pi.set_mode(RX_GPIO, pigpio.INPUT)
 
-    print(f"[serial_link] init: RX=GPIO{RX_GPIO}, TX=GPIO{TX_GPIO}, BAUD={BAUD}")
+    # Use pigpio serial read callback for RX
+    def _rx_callback(gpio, level, tick):
+        nonlocal _rx_buffer, _last_rx_time
+        if level != pigpio.FALLING_EDGE:
+            return
+        try:
+            b = _pi.serial_read_byte(RX_GPIO)  # may not be used depending on wiring
+            _rx_buffer.append(b)
+            _last_rx_time = time.time()
+        except Exception:
+            pass
+
+    # We don't actually attach the callback here – reading is done using
+    # the built-in serial read on a bit-banged UART. See read_seeeduino_status.
+    _rx_buffer = bytearray()
+    _last_rx_time = time.time()
 
 
 def close_serial():
-    """Optional: close on shutdown."""
     global _pi
-    if _pi is None:
-        return
-    try:
-        _pi.bb_serial_read_close(RX_GPIO)
-    except pigpio.error:
-        pass
-    _pi.stop()
-    _pi = None
-    print("[serial_link] closed")
+    if _pi is not None:
+        _pi.stop()
+        _pi = None
 
 
 def _parse_status_line(line: str):
     """
-    Expect lines like:
-    STATUS,is_deployed=1,percent_9v=80,percent_12v=60,emergency=0
+    Parse a STATUS line from the Seeeduino into a dict.
 
-    Returns a dict or None.
+    Format is:
+      STATUS,key=value,key2=value2,...
+
+    Values are kept as strings unless they look like ints/floats.
     """
     line = line.strip()
-    if not line:
-        return None
-    if not line.startswith("STATUS"):
+    if not line.startswith("STATUS,"):
         return None
 
-    parts = line.split(",")
-    data = {"raw": line}
-
-    for p in parts[1:]:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            # try int, fall back to string
-            try:
-                v_parsed = int(v)
-            except ValueError:
-                try:
-                    v_parsed = float(v)
-                except ValueError:
-                    v_parsed = v
-            data[k] = v_parsed
-
-    return data
-
-
-def read_seeeduino_status():
-    """
-    Non-blocking poll.
-    Call this often (e.g. once per main loop).
-    Returns:
-      - dict with parsed STATUS fields (if a new STATUS line arrived)
-      - or None if nothing new / not a STATUS line.
-    """
-    global _rx_buffer
-
-    if _pi is None:
-        init_serial()
-
-    # read any new bytes
-    count, data = _pi.bb_serial_read(RX_GPIO)
-    if count <= 0:
-        return None
-
-    try:
-        text = data.decode("ascii", errors="ignore")
-    except Exception:
-        return None
-
-    _rx_buffer += text
-    result = None
-
-    # process complete lines
-    while "\n" in _rx_buffer:
-        line, _rx_buffer = _rx_buffer.split("\n", 1)
-        line = line.rstrip("\r")
-        if not line:
+    parts = line.split(",")[1:]
+    result = {}
+    for part in parts:
+        if "=" not in part:
             continue
-
-        # Debug: print everything we see
-        # print("[serial_link] RX:", line)
-
-        parsed = _parse_status_line(line)
-        if parsed is not None:
-            result = parsed
-
+        k, v = part.split("=", 1)
+        v = v.strip()
+        # Try to parse numbers
+        try:
+            if "." in v:
+                v_cast = float(v)
+            else:
+                v_cast = int(v)
+            result[k] = v_cast
+        except ValueError:
+            result[k] = v
     return result
 
 
-def _send_line(s: str):
-    """Low-level: send one line (string) via TX using pigpio wave."""
-    global _pi, _tx_ready
+def read_seeeduino_status(timeout_s: float = 0.01):
+    """
+    Read a STATUS line from the Seeeduino if available.
+
+    This assumes that the Seeeduino periodically sends newline-terminated
+    ASCII lines. We look for lines starting with 'STATUS,' and parse them.
+    """
+    global _pi, _rx_buffer, _last_rx_time
+
     if _pi is None:
         init_serial()
-    if not _tx_ready:
-        return
 
-    _pi.wave_clear()
-    _pi.wave_add_serial(TX_GPIO, BAUD, s.encode("ascii"))
-    wid = _pi.wave_create()
-    if wid >= 0:
-        _pi.wave_send_once(wid)
-        while _pi.wave_tx_busy():
-            time.sleep(0.001)
-        _pi.wave_delete(wid)
+    # Read available bytes from RX GPIO bit-banged serial
+    try:
+        count, data = _pi.bb_serial_read(RX_GPIO)
+        if count > 0:
+            _rx_buffer.extend(data)
+            _last_rx_time = time.time()
+    except pigpio.error:
+        # If bb_serial_read isn't initialised, just ignore
+        pass
+
+    # Look for newline in buffer
+    if b"\n" not in _rx_buffer:
+        return None
+
+    line_bytes, _, rest = _rx_buffer.partition(b"\n")
+    _rx_buffer = bytearray(rest)
+
+    try:
+        line = line_bytes.decode("ascii", errors="ignore")
+    except Exception:
+        return None
+
+    status = _parse_status_line(line)
+    if status is not None:
+        print("[SERIAL] RX STATUS:", status)
+    return status
 
 
-def send_goto_to_seeeduino(x: float, y: float, speed: float):
+def _send_line(line: str):
     """
-    High-level command sender.
-    Expected format on Arduino side (you can change it):
-        GOTO,x=<x>,y=<y>,v=<speed>
+    Send a line of ASCII text to the Seeeduino using bit-banged serial.
     """
-    line = f"GOTO,x={x},y={y},v={speed}\n"
-    print("[serial_link] TX:", line.strip())
+    global _pi
+    if _pi is None:
+        init_serial()
+
+    if not line.endswith("\n"):
+        line = line + "\n"
+
+    data = line.encode("ascii")
+    print("[SERIAL] TX RAW:", repr(line.strip()))
+
+    # Simple blocking write using bit-banged serial
+    _pi.bb_serial_write(TX_GPIO, data)
+
+
+def send_goto_to_seeeduino(x_m: float, y_m: float, speed_ms: float):
+    """
+    Send a high-level GOTO command to the Seeeduino.
+
+    Format:
+      GOTO,x=...,y=...,v=...
+    """
+    line = f"GOTO,x={x_m:.2f},y={y_m:.2f},v={speed_ms:.2f}"
     _send_line(line)
+
+
+# ---------------------------------------------------------------------------
+# Small OO wrapper used by main.py (NanoLink / SerialLinkConfig)
+# ---------------------------------------------------------------------------
+
+class SerialLinkConfig:
+    """Lightweight configuration for NanoLink.
+
+    Currently the low-level implementation uses module-level constants
+    RX_GPIO / TX_GPIO / BAUD, but we keep this object so existing code
+    can pass a config without breaking.
+    """
+
+    def __init__(self, port="/dev/serial0", baud=BAUD,
+                 rx_gpio=RX_GPIO, tx_gpio=TX_GPIO):
+        self.port = port
+        self.baud = baud
+        self.rx_gpio = rx_gpio
+        self.tx_gpio = tx_gpio
+
+
+class NanoLink:
+    """Small wrapper around the existing module-level helpers.
+
+    It provides the interface used in main.py:
+      - read_status()
+      - send_goto(x, y, speed)
+      - send_state(...)
+    """
+
+    def __init__(self, config):
+        self.config = config
+        # The current implementation uses pigpio bit-banged serial on the
+        # module-level RX/TX pins. We initialise it here.
+        init_serial()
+
+    # --- API used from main.py ------------------------------------------------
+
+    def read_status(self):
+        return read_seeeduino_status()
+
+    def send_goto(self, x, y, speed):
+        send_goto_to_seeeduino(x, y, speed)
+
+    def send_state(
+        self,
+        above_seabed_m,
+        autonomous,
+        lat,
+        lon,
+        alt,
+        temp_c,
+        hum_pct,
+        leakage,
+        heading_deg=None,
+    ):
+        auto_flag = 1 if autonomous else 0
+        parts = [
+            "PI",
+            f"ab={above_seabed_m:.2f}",
+            f"auto={auto_flag}",
+        ]
+
+        if lat is not None:
+            parts.append(f"lat={lat:.6f}")
+        if lon is not None:
+            parts.append(f"lon={lon:.6f}")
+        if alt is not None:
+            parts.append(f"alt={alt:.2f}")
+
+        parts.extend(
+            [
+                f"temp={temp_c:.2f}",
+                f"hum={hum_pct:.2f}",
+                f"leak={int(bool(leakage))}",
+            ]
+        )
+
+        if heading_deg is not None:
+            parts.append(f"hdg={heading_deg:.2f}")
+
+        line = ",".join(parts) + "\n"
+        print("[serial_link] TX:", line.strip())
+        _send_line(line)
