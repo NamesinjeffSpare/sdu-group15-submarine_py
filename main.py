@@ -345,6 +345,35 @@ def main():
     if "polygon" not in backend or backend["polygon"] is None:
         backend["polygon"] = []
 
+    # --- Local sensors on the Raspberry Pi ---
+    temp_sensor = None
+    leakage_sensor = None
+    flashlight = None
+
+    try:
+        temp_sensor = TemperatureSensor()
+        print("[TEMP] TemperatureSensor initialised")
+    except Exception as e:
+        print("[TEMP] Error initialising TemperatureSensor:", e)
+
+    try:
+        leak_cfg = LeakageConfig(
+            pin=12,             # BCM 12 (see leakage_test.py)
+            sample_period_s=0.1,
+            debounce_count=10,
+            active_low=True
+        )
+        leakage_sensor = LeakageSensor(leak_cfg)
+        print("[LEAK] LeakageSensor initialised on GPIO", leak_cfg.pin)
+    except Exception as e:
+        print("[LEAK] Error initialising LeakageSensor:", e)
+
+    try:
+        flashlight = Flashlight()
+        print("[FLASH] Flashlight initialised")
+    except Exception as e:
+        print("[FLASH] Error initialising Flashlight:", e)
+
     # Keep last known position so backend still updates even with no GPS fix
     last_lat = backend.get("lat", 54.9130)
     last_lon = backend.get("lon", 9.7785)
@@ -386,6 +415,19 @@ def main():
     while True:
         now = time.time()
         has_warning = False
+        leak_latched = False
+
+        # --- leakage sensor update ---
+        if leakage_sensor is not None:
+            try:
+                if leakage_sensor.update():
+                    print("[LEAK] Leak detected – state latched")
+                leak_latched = leakage_sensor.is_latched()
+            except Exception as e:
+                print("[LEAK] Error reading leakage sensor:", e)
+
+        if leak_latched:
+            has_warning = True
 
         status = read_seeeduino_status()
         if status is not None:
@@ -479,12 +521,26 @@ def main():
             else:
                 print("[GPS] No fix – sending last known position")
 
-            # Send state to backend
+            # --- local environmental sensors (temp / humidity) ---
+            temp_c = 0.0
+            hum_pct = 0.0
+            if temp_sensor is not None:
+                try:
+                    reading = temp_sensor.update()
+                    if reading:
+                        temp_c = float(reading.get("temp_c", temp_c))
+                        hum_pct = float(reading.get("humidity", hum_pct))
+                    elif getattr(temp_sensor, "last_ok", None) is not None:
+                        temp_c = float(temp_sensor.last_ok.get("temp_c", temp_c))
+                        hum_pct = float(temp_sensor.last_ok.get("humidity", hum_pct))
+                except Exception as e:
+                    print("[TEMP] Read error:", e)
+
+            # Send telemetry to backend (Pi does NOT overwrite mission config)
             payload = {
                 "explore": backend.get("explore", False),
                 "autonomous": backend.get("autonomous", True),
                 "meters": backend.get("meters", 0),
-                # REAL free SD space (MB)
                 "sMemory": get_free_sd_mb(PHOTO_DIR),
                 "sVoltage": backend.get("sVoltage", 0),
                 "sDry": backend.get("sDry", 0),
@@ -493,6 +549,9 @@ def main():
                 "lon": last_lon,
                 "alt": last_alt,
                 "polygon": backend.get("polygon", []),
+                "temperature": temp_c,
+                "humidity": hum_pct,
+                "leakage": int(bool(leak_latched)),
             }
 
             try:
@@ -506,11 +565,6 @@ def main():
             above_seabed_m = backend.get("meters", 0)
             autonomous = backend.get("autonomous", True)
 
-            # TODO: hook real sensor readings here instead of 0/False:
-            temp_c = 0.0
-            hum_pct = 0.0
-            leakage = False
-
             try:
                 send_state_to_seeeduino(
                     above_seabed_m=above_seabed_m,
@@ -520,7 +574,7 @@ def main():
                     alt=last_alt,
                     temp_c=temp_c,
                     hum_pct=hum_pct,
-                    leakage=leakage,
+                    leakage=bool(leak_latched),
                     heading_deg=gps_heading_deg,
                 )
             except Exception as e:
@@ -546,10 +600,27 @@ def main():
         except Exception as e:
             print("[LED] Error updating RGB LED:", e)
 
-        # --- photo capture ---
+        # --- photo capture (flashlight on before photo, off after) ---
         if photo_interval > 0 and (now - last_photo_time) >= photo_interval:
             print("[CAMERA] Time to take photo")
+            # Turn on flashlight for the shot
+            if flashlight is not None:
+                try:
+                    flashlight.on()
+                    print("[FLASH] On for photo")
+                except Exception as e:
+                    print("[FLASH] Error turning on flashlight:", e)
+
             filepath = capture_and_store_photo()
+
+            # Turn off flashlight after the shot
+            if flashlight is not None:
+                try:
+                    flashlight.off()
+                    print("[FLASH] Off after photo")
+                except Exception as e:
+                    print("[FLASH] Error turning off flashlight:", e)
+
             if filepath:
                 print("[CAMERA] Stored photo at:", filepath)
             last_photo_time = now
