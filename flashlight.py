@@ -6,14 +6,7 @@ except ImportError:
 
 
 class Flashlight:
-    """
-    Flashlight controlled by a GPIO pin.
-
-    active_high=True means:
-      - GPIO HIGH  -> flashlight ON
-      - GPIO LOW   -> flashlight OFF
-    """
-
+    
     def __init__(self, pin=5, active_high=True, initial_off=True):
         if GPIO is None:
             raise RuntimeError("RPi.GPIO not available")

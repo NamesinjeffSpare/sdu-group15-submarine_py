@@ -1,4 +1,3 @@
-# test_rgb.py
 import time
 from RGB import RGB
 

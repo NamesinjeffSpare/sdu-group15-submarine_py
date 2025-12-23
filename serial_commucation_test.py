@@ -1,8 +1,7 @@
-# test_serial_link.py
 import time
 from serial_link import SerialLink
 
-# If your schematic uses physical pins 38/40:
+#uses physical pins 38/40:
 # Pin 38 = GPIO20, Pin 40 = GPIO21
 RX_GPIO = 20
 TX_GPIO = 21

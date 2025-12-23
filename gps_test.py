@@ -11,7 +11,6 @@ while True:
     if line.startswith("$") and ("GGA" in line or "GSA" in line or "RMC" in line):
         print(line)
 
-        # Simple human hint for GGA/RMC
         if "GGA" in line:
             parts = line.split(",")
             # GGA field 6 = fix quality (0 = none, 1 = GPS fix, 2 = DGPS, etc.)

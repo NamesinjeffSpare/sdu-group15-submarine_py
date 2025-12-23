@@ -40,10 +40,7 @@ class LeakageSensor:
         )
 
     def update(self):
-        """
-        Call periodically.
-        Returns True ONCE when leakage is confirmed.
-        """
+        
         now = time.time()
         if now - self._last_sample < self.cfg.sample_period_s:
             return False

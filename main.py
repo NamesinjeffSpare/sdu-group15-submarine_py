@@ -51,14 +51,6 @@ def send_state_to_seeeduino(
     leakage,
     heading_deg=None,
 ):
-    """
-    Send state packet to Seeeduino. serial_link.NanoLink is expected to
-    turn this into the 'PI,...' line for the microcontroller.
-
-    heading_deg allows the Raspberry Pi to calibrate the submarine's
-    forward direction using GPS and pass that on to the microcontroller.
-    If heading_deg is None the field is omitted.
-    """
     return _link.send_state(
         above_seabed_m=above_seabed_m,
         autonomous=autonomous,
@@ -129,10 +121,6 @@ def recommended_speed(camera_area_m2, photo_interval_s):
 
 
 def bearing_deg(lat1, lon1, lat2, lon2):
-    """Compute bearing in degrees from (lat1, lon1) to (lat2, lon2).
-
-    Returns a value in [0, 360) or None if the movement is too small.
-    """
     if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
         return None
 
@@ -378,7 +366,7 @@ def main():
     last_lat = backend.get("lat", 54.9130)
     last_lon = backend.get("lon", 9.7785)
     last_alt = backend.get("alt", 0.0)
-    # Previous GPS fix used to compute heading
+    
     prev_lat = None
     prev_lon = None
     gps_heading_deg = None
@@ -417,7 +405,6 @@ def main():
         has_warning = False
         leak_latched = False
 
-        # --- leakage sensor update ---
         if leakage_sensor is not None:
             try:
                 if leakage_sensor.update():
@@ -442,7 +429,6 @@ def main():
             else:
                 status["warning_types"][0] = warning0
 
-            # Derive a simple warning flag for the RGB LED
             if bool(status.get("emergency_active")) or status.get("emergency_reason_mask", 0):
                 has_warning = True
             ultra_err = status.get("ultrasonic_error_latched")
@@ -465,7 +451,6 @@ def main():
             failed_waypoints,
         )
 
-        # --- poll backend state ------------------------------------------------
         if now - last_backend >= BACKEND_REFRESH:
             new_state = get_backend_state()
             if new_state:
@@ -499,7 +484,6 @@ def main():
 
             last_backend = now
 
-        # --- ALWAYS send update to backend + state to Seeeduino ---
         if now - last_send >= GPS_INTERVAL:
             fix = None
             if gps is not None:
@@ -509,7 +493,6 @@ def main():
                     print("[GPS] Error getting fix:", e)
 
             if fix:
-                # Use consecutive fixes to estimate heading for calibration.
                 prev_lat, prev_lon = last_lat, last_lon
                 last_lat, last_lon, last_alt = fix["lat"], fix["lon"], fix["alt"]
                 gps_h = bearing_deg(prev_lat, prev_lon, last_lat, last_lon)
@@ -521,7 +504,6 @@ def main():
             else:
                 print("[GPS] No fix – sending last known position")
 
-            # --- local environmental sensors (temp / humidity) ---
             temp_c = 0.0
             hum_pct = 0.0
             if temp_sensor is not None:
@@ -536,7 +518,6 @@ def main():
                 except Exception as e:
                     print("[TEMP] Read error:", e)
 
-            # Send telemetry to backend (Pi does NOT overwrite mission config)
             payload = {
                 "explore": backend.get("explore", False),
                 "autonomous": backend.get("autonomous", True),
@@ -559,8 +540,6 @@ def main():
                 print("[UPDATE] Status:", r.status_code)
             except Exception as e:
                 print("[UPDATE] POST error:", e)
-
-            # --- ALSO send state to Seeeduino over serial ---
 
             above_seabed_m = backend.get("meters", 0)
             autonomous = backend.get("autonomous", True)
@@ -600,7 +579,6 @@ def main():
         except Exception as e:
             print("[LED] Error updating RGB LED:", e)
 
-        # --- photo capture (flashlight on before photo, off after) ---
         if photo_interval > 0 and (now - last_photo_time) >= photo_interval:
             print("[CAMERA] Time to take photo")
             # Turn on flashlight for the shot
@@ -626,7 +604,6 @@ def main():
             last_photo_time = now
 
         # --- attempt upload periodically when internet is available ---
-        # (does nothing underwater, uploads everything when back online)
         if now - last_upload_attempt >= 10.0:
             upload_all_images()
             last_upload_attempt = now

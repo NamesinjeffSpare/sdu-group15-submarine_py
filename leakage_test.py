@@ -2,7 +2,7 @@
 import time
 from leakage_sensor import LeakageSensor, LeakageConfig
 
-LEAKAGE_GPIO_PIN = 12   # BCM numbering (GPIO17 = physical pin 11)
+LEAKAGE_GPIO_PIN = 12   
 
 cfg = LeakageConfig(
     pin=LEAKAGE_GPIO_PIN,
